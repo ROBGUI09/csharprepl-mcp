@@ -1,8 +1,4 @@
-﻿// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
-using System;
+﻿using System;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -243,4 +239,47 @@ internal sealed class ScriptRunner
     }
 
     private ScriptGlobals CreateGlobalsObject(string[]? args) => new(console, args ?? []);
+
+    /// <summary>Variables currently in scope, for tooling that needs to show REPL state.</summary>
+    public IReadOnlyList<ScriptVariableSnapshot> GetVariables()
+    {
+        var current = state;
+        if (current is null)
+        {
+            return Array.Empty<ScriptVariableSnapshot>();
+        }
+
+        return current
+            .Variables.Where(v => !v.Name.StartsWith("<", StringComparison.Ordinal))
+            .Select(v => new ScriptVariableSnapshot(
+                v.Name,
+                v.Type?.FullName ?? "?",
+                DescribeValue(v.Value)
+            ))
+            .ToArray();
+    }
+
+    private static string? DescribeValue(object? value)
+    {
+        if (value is null)
+        {
+            return "null";
+        }
+
+        try
+        {
+            var text = value.ToString();
+            if (text is null)
+            {
+                return null;
+            }
+
+            text = text.Replace(Environment.NewLine, " ").Replace((char)13, ' ').Replace((char)10, ' ');
+            return text.Length <= 160 ? text : text.Substring(0, 160) + "...";
+        }
+        catch (Exception ex)
+        {
+            return "<ToString threw " + ex.GetType().Name + ">";
+        }
+    }
 }

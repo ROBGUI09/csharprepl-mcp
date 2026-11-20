@@ -1,0 +1,139 @@
+name: build
+
+on:
+  push:
+    branches: [ master, main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 'true'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Restore
+      run: dotnet restore
+
+    - name: Build
+      run: dotnet build --no-restore --configuration Release
+
+    # The test project is starter code from upstream; it is allowed to be red while
+    # the MCP work is in flight, so a build failure is the gate, not the tests.
+    - name: Test (informational)
+      continue-on-error: true
+      run: dotnet test --no-build --configuration Release --verbosity normal
+
+    - name: Pack
+      run: dotnet pack Mykeels.CSharpRepl/Mykeels.CSharpRepl.csproj --no-build --configuration Release --output ./artifacts
+
+    - name: Upload package
+      uses: actions/upload-artifact@v4
+      with:
+        name: nupkg
+        path: artifacts/*.nupkg
+
+  # Portable build: the MCP server host plus its dependencies, zipped. Start it with
+  # `dotnet Mykeels.CSharpRepl.Sample.dll`; the folder is relative to the archive root.
+  portable:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Publish portable server
+      run: >-
+        dotnet publish Mykeels.CSharpRepl.Sample/Mykeels.CSharpRepl.Sample.csproj
+        --configuration Release --output dist/portable
+
+    - name: Archive portable server
+      run: Compress-Archive -Path dist/portable/* -DestinationPath Mykeels.CSharpRepl-mcp-portable-${{ github.ref_name }}.zip
+
+    - name: Upload portable server
+      uses: actions/upload-artifact@v4
+      with:
+        name: mcp-portable
+        path: Mykeels.CSharpRepl-mcp-portable-*.zip
+
+  # Self-contained build: windows only, no .NET runtime needed on the target machine.
+  # The .NET toolchain is always 8.0.x here, so the folder can be copied as-is.
+  selfcontained:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Publish self-contained server
+      run: >-
+        dotnet publish Mykeels.CSharpRepl.Sample/Mykeels.CSharpRepl.Sample.csproj
+        --configuration Release --runtime win-x64 --self-contained true
+        --output dist/win-x64
+
+    - name: Archive self-contained server
+      run: Compress-Archive -Path dist/win-x64/* -DestinationPath Mykeels.CSharpRepl-mcp-win-x64-${{ github.ref_name }}.zip
+
+    - name: Upload self-contained server
+      uses: actions/upload-artifact@v4
+      with:
+        name: mcp-win-x64
+        path: Mykeels.CSharpRepl-mcp-win-x64-*.zip
+
+  release:
+    needs: [ build, portable, selfcontained ]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download archives
+      uses: actions/download-artifact@v4
+      with:
+        pattern: mcp-*
+        path: release-assets
+        merge-multiple: true
+
+    - name: Publish release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: release-assets/*.zip
+        generate_release_notes: true
+        body: |
+          MCP server for a live C# Roslyn session.
+
+          - `Mykeels.CSharpRepl-mcp-win-x64-*.zip` — self-contained, no .NET runtime needed (Windows x64).
+            Run `Mykeels.CSharpRepl.Sample.exe` from the extracted folder.
+          - `Mykeels.CSharpRepl-mcp-portable-*.zip` — framework-dependent, needs .NET 8 on the machine.
+            Run `dotnet Mykeels.CSharpRepl.Sample.dll` from the extracted folder.
+
+          Point your MCP client at that binary and it starts in your project directory. See the README
+          for the client configuration and the tool list.

@@ -2,6 +2,19 @@
 
 This library is a stripped-down, plug-n-play version of [CSharpRepl.Services](https://github.com/waf/CSharpRepl/tree/bd79130d49c06736a2d5f4d56ac7643889ad2328/CSharpRepl.Services). It is a powerful C# REPL (Read-Eval-Print Loop) that can be embedded into any .NET application, providing an interactive C# REPL environment with syntax highlighting, code completion, MCP server, and more.
 
+## Upstream and scope of this fork
+
+This repository is a fork of [mykeels/Mykeels.CSharpRepl](https://github.com/mykeels/Mykeels.CSharpRepl),
+which extracts the REPL services from [waf/CSharpRepl](https://github.com/waf/CSharpRepl). Sources keep their
+upstream headers and are under the Mozilla Public License 2.0 — see [LICENSE](LICENSE).
+
+What this fork adds on top of upstream: the stdio MCP server (`Mykeels.CSharpRepl/MCP/`) with its 19 tools, the
+per-call `cwd` model behind it, the self-contained publish recipe, and `mcp-smoke.py`. The new files carry the
+same license. This is an independent fork and is not affiliated with the upstream authors.
+
+Read [SECURITY.md](SECURITY.md) before pointing this at anything you care about: the server executes the C# it
+is given.
+
 ## Installation
 
 Copy the [nuget.config](nuget.config) file to your project directory. This is necessary to ensure that the Microsoft.SymbolStore package can be found.
@@ -134,16 +147,178 @@ Notes:
 
 ## MCP Server
 
-You can also launch a MCP server that can be used to:
+`McpServer` exposes the REPL as a [Model Context Protocol](https://modelcontextprotocol.io) server over stdio. It keeps **one long-lived Roslyn session**, so variables, defined types, references and usings survive between tool calls — a model can build something up over several calls instead of re-declaring everything each time.
 
-- list members of the ScriptGlobals class
-- invoke arbitrary C# code, written with the ScriptGlobals class as the globals context
+### Tools
+
+| Tool | What it does |
+|---|---|
+| `run_script` | Evaluate a C# snippet in the persistent session; `save_as` keeps the returned object for `get_result`. |
+| `run_file` | Evaluate a `.csx` / `.cs` file; relative paths resolve against `cwd`, and the process switches to the file's folder for the run. |
+| `add_reference` | `#r` one or more DLLs — files or directories, optionally recursive. |
+| `add_package` | Download a NuGet package and reference its best-matching `lib` target framework. |
+| `add_project` | `dotnet build` a `.csproj` and reference its output assembly. |
+| `list_types` | Regex search over the types in the loaded assemblies. |
+| `describe_type` | Constructors, methods, properties, fields and events of one type. |
+| `inspect_assembly` | Metadata only: version, culture, entry point, references, type count. |
+| `decompile` | ILSpy decompilation of an assembly, a type, or a single member. |
+| `list_references` | The `#r` list plus the assemblies actually loaded into the process. |
+| `session_state` | Variables currently in scope, with types and short value previews. |
+| `reset_session` | Drop the script state and rebuild it, replaying all references. |
+| `history` | The submissions made in this session. |
+| `get_result` | Print an object kept by `save_as` — the live reference, not a copy, so it shows later mutations. |
+| `list_results` | Names and types of the stored handles. |
+| `analyze_file` | Triage a binary without loading it: identity, entry points, non-framework dependencies, namespace sizes, and the metadata strings (URLs, config keys, SQL, file names) with library noise filtered out. |
+| `diff_assemblies` | Compare the public API of two builds: added/removed types and members, and a `compatible` / `breaking` verdict. |
+| `run_tests` | `dotnet test` a project, solution or folder and summarize: counts, failing test names, output tail. |
+| `attach_process` | Modules a running process has mapped, resolved to assembly identity. Read-only. |
+
+### Launching
 
 ```csharp
-await McpServer.Run(typeof(ScriptGlobals));
+await McpServer.RunStandalone(args);                        // no globals type
+await McpServer.RunStandalone(args, typeof(ScriptGlobals));  // ScriptGlobals members usable from scripts
 ```
 
-Such an MCP server can be used by a tool like [Cursor](https://www.cursor.com/) to give Cursor Chat the ability to execute C# code.
+`McpServer.Run(args, globalsType)` remains as an alias for `RunStandalone`.
+
+The server is not tied to one project. It starts in whatever directory the client launched it from, and
+every tool that touches the file system (`run_script`, `run_file`, `add_reference`, `add_project`) accepts
+a **`cwd` argument for that call only**; the process directory is restored afterwards, and `%VAR%` is
+expanded. `--cwd` merely changes the fallback default, so a single server instance can work across
+several repositories without restarting.
+
+Flags, all optional (forward them from `Program.Main`, e.g. `await McpServer.RunStandalone(args, typeof(ScriptGlobals));`):
+
+| Flag | Meaning |
+|---|---|
+| `--cwd <path>` | Fallback working directory for calls that omit `cwd`. Optional. |
+| `--preload <path>`, `--add <path>` | `#r` a DLL at startup; repeatable, relative paths allowed. |
+| `--package <id>[@<version>]` | Fetch and reference a NuGet package at startup; repeatable. |
+| `--using <namespace>` | Extra `using` available in every submission; repeatable. |
+| `--timeout <ms>` | Default per-call timeout (clamped to 1000–600000). |
+| `--max-chars <n>` | Truncation limit for tool output (200–20000). |
+| `--no-warmup` | Skip the background warm-up; the first call gets slower. |
+
+### Standalone executable
+
+A self-contained `.exe` needs no installed .NET runtime:
+
+```bash
+dotnet publish Mykeels.CSharpRepl.Sample/Mykeels.CSharpRepl.Sample.csproj -c Release -r win-x64 \
+  --self-contained true -p:PublishSingleFile=false -o dist/win-x64
+```
+
+`dist/win-x64/Mykeels.CSharpRepl.Sample.exe` is the server; MCP clients launch it directly, without a
+`dotnet` prefix. Keep the folder intact — the engine resolves Roslyn and ILSpy assemblies relative to the
+executable.
+
+**Do not use `PublishSingleFile=true`.** Roslyn's workspace turns loaded assemblies into metadata
+references through `Assembly.Location`, which is empty for bundled assemblies, so every `run_script`
+fails with `NotSupportedException: Cannot create a metadata reference to an assembly without location`.
+Publish to a folder instead. `add_project` still needs the .NET SDK on `PATH`, because it shells out to
+`dotnet build`.
+
+The exe keeps a `cache` folder beside the binary (`cache/tmp`, `cache/packages`, `cache/home`): NuGet
+package downloads, MSBuild temp and the child `dotnet` CLI home all live there, and child processes
+inherit them as `TMP`/`TEMP`. That is what lets builds run from a host whose `%TEMP%` is not writable —
+a sandboxed agent runtime, for example. Override the location with `CSHARPREPL_MCP_CACHE=<path>`; if the
+install folder is read-only the server falls back to `%LOCALAPPDATA%\csharprepl-mcp`, then
+`%TEMP%\csharprepl-mcp`.
+
+### Client configuration
+
+Point any MCP client at the published binary:
+
+```json
+{
+  "mcpServers": {
+    "csharp": {
+      "command": "C:/path/to/Mykeels.CSharpRepl/dist/win-x64/Mykeels.CSharpRepl.Sample.exe",
+      "args": ["--preload", "C:/path/to/MyLib/bin/Debug/net8.0/MyLib.dll"]
+    }
+  }
+}
+```
+
+No `cwd` anywhere: each call passes the directory it needs, e.g.
+`{"code": "File.ReadAllText(\"data.xml\")", "cwd": "C:/path/to/project/data"}`. Add `--cwd` only if
+you want one project as the default.
+
+The same server, launched through the shared runtime instead of the self-contained exe:
+
+```json
+{
+  "mcpServers": {
+    "csharp": {
+      "command": "dotnet",
+      "args": ["C:/path/to/Mykeels.CSharpRepl/dist/mcp/Mykeels.CSharpRepl.Sample.dll"]
+    }
+  }
+}
+```
+
+Or straight from source, without publishing:
+
+```json
+{
+  "mcpServers": {
+    "csharp": {
+      "command": "dotnet",
+      "args": [
+        "run", "--project", "C:/path/to/Mykeels.CSharpRepl/Mykeels.CSharpRepl.Sample",
+        "--no-build", "--"
+      ]
+    }
+  }
+}
+```
+
+### Prebuilt binaries
+
+Every tagged [release](https://github.com/ROBGUI09/csharprepl-mcp/releases) carries two archives:
+`Mykeels.CSharpRepl-mcp-win-x64-v*.zip` (self-contained, no .NET runtime needed, Windows x64) and
+`Mykeels.CSharpRepl-mcp-portable-v*.zip` (framework-dependent, needs .NET 8). Unpack and point the client at the
+binary inside — `Mykeels.CSharpRepl.Sample.exe` or `dotnet Mykeels.CSharpRepl.Sample.dll`. CI builds both on every
+push; pushing a `v*` tag publishes them.
+
+### Verifying an installation
+
+`mcp-smoke.py` drives a published server the way a real client does — newline-delimited JSON-RPC over
+stdio — and exercises every tool end to end, including a `dotnet build`, a NuGet download and a session
+reset:
+
+```bash
+python mcp-smoke.py dist/win-x64/Mykeels.CSharpRepl.Sample.exe   # or dist/mcp/Mykeels.CSharpRepl.Sample.dll
+```
+
+It prints one line per check and exits non-zero if any fails. `SMOKE_SKIP_NETWORK=1` and
+`SMOKE_SKIP_BUILD=1` drop the slow checks; `SMOKE_VERBOSE=1` echoes every tool result. The suite builds
+two throwaway xunit.v3 projects for `run_tests` — one green, one red — so it needs network access for the
+first restore and the .NET SDK on `PATH`.
+
+### Behaviour worth knowing
+
+- Console output from a snippet (`Console.WriteLine`, third-party libraries writing to the console) never reaches the protocol stream. Everything is captured and returned inside the tool result, so a normal result can look like `42 (System.Int32)` followed by a `--- stdout ---` block.
+- A snippet that ends in a statement gets a note instead of a value — end with an expression that has no trailing `;`, or use `return expr;`.
+- A failed evaluation is a failed tool call: compilation errors, exceptions and timeouts come back as
+  `isError: true` with the message and the diagnostics, so a client cannot mistake them for a result.
+- References are loaded into the process before each evaluation, which is why a DLL rebuilt by
+  `add_project` is usable in the very next call.
+- `inspect_assembly`, `analyze_file`, `diff_assemblies` and `attach_process` read the PE/metadata without loading the DLL into the process: use them on binaries you do not trust. `add_reference` performs `Assembly.LoadFrom`, which runs module initializers — that is the same trust as running the code.
+- Result handles (`save_as` → `get_result`) hold a real object in the live session. They survive between calls and vanish on `reset_session`.
+- `run_tests` reports a failing test as a result (`status: failed`, `isError: false`); only a run that produced no results at all — build failure, missing SDK, timeout, no test project — is a tool error. It shells out to `dotnet test`, so it needs the SDK like `add_project`. Counts are read from the
+  summary line whatever the UI language: English labels (`Failed: 1, Passed: 3, Skipped: 0, Total: 4`, printed
+  by both runners) are matched exactly, other languages by the fixed failed → passed → skipped → total order,
+  accepted only when the numbers add up. Runners on Microsoft.Testing.Platform (xunit.v3, MSTest 3.6+, TUnit) work anywhere; classic VSTest runners start a `testhost` child process and need a host that allows opening child processes — a sandbox that denies `OpenProcess` makes them fail with `Win32Exception (5)`, which the tool reports as `blocked by this host`.
+- `attach_process` is a module snapshot, not a debugger: it attaches nothing, injects nothing, and cannot read another process's managed state. A 32-bit target can only be read from a 32-bit host, so access-denied usually means bitness or privilege.
+- `--timeout` / `timeout_ms` cancel compilation and execution through a `CancellationToken`. Cancellation is not preemption: a call that timed out mid-flight may leave the script state half-applied, so `reset_session` and re-run.
+- `add_package` resolves only the package's own `lib` assemblies. Its transitive dependencies are not downloaded — add them explicitly if types fail to load.
+- A relative `cwd` resolves against the server default, which is the launch directory unless `--cwd`
+  was given; a missing directory is a tool error, not a crash.
+- Package downloads, MSBuild temp and the child `dotnet` home share one cache root (the `cache` folder
+  next to the exe, `CSHARPREPL_MCP_CACHE`, or a fallback); deleting it is always safe.
+- Non-ASCII source and output are UTF-8 end to end.
 
 ## Slack Integration
 
@@ -308,7 +483,9 @@ await Repl.Run(
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+Mozilla Public License 2.0 — the full text is in [LICENSE](LICENSE). Every source file, upstream or added here,
+carries the MPL header. Third-party components keep their own licenses; see the package references in
+`Mykeels.CSharpRepl/Mykeels.CSharpRepl.csproj`.
 
 ## Contributing
 

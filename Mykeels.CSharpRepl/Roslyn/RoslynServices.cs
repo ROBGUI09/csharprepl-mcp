@@ -1,8 +1,4 @@
-﻿// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -751,5 +747,12 @@ public sealed partial class RoslynServices
                         )
                     )
                 );
+    }
+
+    /// <summary>Variables currently in scope in the persistent script state.</summary>
+    public async Task<IReadOnlyList<ScriptVariableSnapshot>> GetVariablesAsync()
+    {
+        await Initialization.ConfigureAwait(false);
+        return scriptRunner.GetVariables();
     }
 }

@@ -37,7 +37,9 @@ else if (args.Contains("slack"))
 }
 else
 {
-    await McpServer.Run(typeof(ScriptGlobals));
+    // Default command is the stdio MCP server so existing client configs keep working.
+    // Extra arguments are forwarded: --preload <dll|dir> --package <id@ver> --using <ns> ...
+    await McpServer.RunStandalone(args, typeof(ScriptGlobals));
 }
 
 string RequireConfiguration(string name) =>
